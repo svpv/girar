@@ -21,20 +21,58 @@ if [ -n "$bloat" ]; then
 else
 	# Final repo: need to scan for useful files.
 	for arch in $GB_ARCH noarch; do
-		gb-x-useful-files $(set +f && ls -d "$REPO_DIR"/$arch/RPMS.?*) >"$tmpdir"/useful-files.$arch ||
+		if ! fgrep -qsx "$arch" plan/change-arch; then
+			f=$REPO_DIR/$arch/base/useful-files
+			if [ -s "$f" ]; then
+				ln -f "$f" "$f".new
+				continue
+			fi
+		fi
+		gb-y-useful-files "$REPO_DIR" "$arch" ||
 			echo 1 >>"$tmpdir"/FAIL &
 	done
 	wait
 	if [ -s "$tmpdir"/FAIL ]; then
 		exit 1
 	fi
-	set --
 	for arch in $GB_ARCH noarch; do
-		set -- "$@" "$tmpdir"/useful-files.$arch
+		if [ "$arch" = noarch ]; then
+			# noarch pkglist depends on useful files
+			# from all other architectures.
+			aa="$GB_ARCH noarch"
+		else
+			# arch pkglist depends on noarch useful files.
+			aa="$arch noarch"
+		fi
+		if ! fgrep -qsx "$arch" plan/change-arch; then
+			# Probably won't need to run genbasedir at all.
+			# Merge down the previous state, for comparison.
+			set --
+			have=1
+			for a in $aa; do
+				f=$REPO_DIR/$a/base/useful-files
+				if ! [ -s "$f" ]; then
+					have=
+					break
+				fi
+				set -- "$@" "$f"
+			done
+			[ -z "$have" ] ||
+			cut -f2 "$@" |LC_ALL=C sort -u >"$tmpdir"/useful-files.$arch.old
+		fi
+		# Rotate.
+		rm -f $REPO_DIR/$arch/base/useful-files
+		mv $REPO_DIR/$arch/base/useful-files{.new,}
+		# Merge down the new state.
+		set --
+		for a in $aa; do
+			f=$REPO_DIR/$a/base/useful-files
+			set -- "$@" "$f"
+		done
+		cut -f2 "$@" |LC_ALL=C sort -u >"$tmpdir"/useful-files.$arch.new
 	done
-	LC_ALL=C sort -m -u -o "$tmpdir"/useful-files -- "$@"
 	# By default, both xz and bzip2 should be enabled.
-	set -- --useful-files="$tmpdir"/useful-files --no-scan \
+	set -- --no-scan \
 		--changelog-since=2009-01-01 \
 		--xz ${GB_REPO_OPT_BZ2:---bz2}
 	export XZ_OPT='--lzma2=nice=128,depth=80,lc=4'
@@ -47,14 +85,26 @@ description="${GB_REPO_DESCRIPTION:-ALT Linux $label}"
 date_s="$(date +%s)"
 
 for arch in $GB_ARCH noarch; do
-	[ -d "$REPO_DIR/$arch" ] || continue
-
-	# Arch packages haven't changed?
+	useful_files=
 	maybe_unchanged=
-	if [ -z "$bloat" ] && ! fgrep -qsx "$arch" plan/change-arch; then
-		# But the result also depends on the list of useful-files,
-		# which might have changed due to other architectures.
-		maybe_unchanged='--maybe-unchanged'
+	if [ -n "$bloat" ]; then
+		# Probably RPMS.task, no separate noarch repo.
+		[ -d "$REPO_DIR/$arch" ] || continue
+	else
+		useful_files=--useful-files=$tmpdir/useful-files.$arch.new
+		# Arch packages haven't changed?
+		if ! fgrep -qsx "$arch" plan/change-arch; then
+			# But the result also depends on the list of useful-files,
+			# which might have changed due to other architectures.
+			cmp -s $tmpdir/useful-files.$arch.{old,new} && continue
+			maybe_unchanged=--maybe-unchanged
+		elif [ "$arch" != noarch ]; then
+			# Some packages don't have *-debuginfo subpackages.
+			# Still use --maybe-unchanged in this case.
+			debuginfo=$(awk -F'\t' '$3==arch&&$1~/-debuginfo$/{print 1;exit}' \
+					arch=$arch plan/{add,rm}-bin )
+			[ -n "$debuginfo" ] || maybe_unchanged=--maybe-unchanged
+		fi
 	fi
 
 	comps="${GB_REPO_COMPONENT_NAMES-}"
@@ -65,7 +115,7 @@ for arch in $GB_ARCH noarch; do
 		continue
 	}
 
-	genbasedir "$@" $maybe_unchanged \
+	genbasedir "$@" $useful_files $maybe_unchanged \
 		--cachedir="$HOME"/.cache \
 		--architecture="$arch" \
 		--architectures="$GB_ARCH noarch" \

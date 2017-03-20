@@ -1,0 +1,51 @@
+#!/bin/sh -efu
+#
+# This will create base/useful-files.new by patching the existing
+# useful-files, or by creating it from scratch on the first run.
+# The caller then can compare the two lists, after which he or she
+# should rename useful-files.new to useful-files.
+
+REPO_DIR=$1 arch=$2
+
+export LANG=C LC_ALL=C
+
+N='%{NAME}'
+Q="[$N\t%{REQUIRENAME}\n][$N\t%{PROVIDENAME}\n][$N\t%{CONFLICTNAME}\n][$N\t%{OBSOLETENAME}\n]"
+
+O=$REPO_DIR/$arch/base/useful-files
+
+# genpkglist always keeps PATH-like entries.
+S='\|/bin/[^/]\+$|d;\|/sbin/[^/]\+$|d'
+
+if ! [ -s $O ]; then
+	# First run.
+	rm -f $O.new
+	set +f
+	find $REPO_DIR/$arch/RPMS.* -mindepth 1 -maxdepth 1 -name '*.rpm' -execdir \
+		rpmquery --qf "$Q" -p -- '{}' + |
+		grep $'\t/.*[^)]$' |
+		sort -u >$O.new
+	[ -s $O.new ]
+	sed -i "$S" $O.new
+	exit 0
+fi
+
+. gb-sh-tmpdir
+. gb-sh-rpmhdrcache
+
+awk -F'\t' '$3==arch{print$1}' arch=$arch plan/rm-bin >$tmpdir/rm-names
+join -t$'\t' -v1 $O $tmpdir/rm-names >$tmpdir/out
+
+awk -F'\t' '$3==arch{print$5}' arch=$arch plan/add-bin >$tmpdir/add-pkgs
+xargs -r --delimiter='\n' <$tmpdir/add-pkgs \
+	rpmquery --qf "$Q" -p -- |
+	grep $'\t/.*[^)]$' |
+	sort -u >$tmpdir/add-lines
+sed -i "$S" $tmpdir/add-lines
+
+sort -m -o $tmpdir/out{,} $tmpdir/add-lines
+if cmp -s $O $tmpdir/out; then
+	ln -f $O $O.new
+else
+	mv $tmpdir/out $O.new
+fi
